@@ -22,16 +22,36 @@ LOG = logging.getLogger(__name__)
 
 
 class Agent:
-    # On 20 identical mock seeds, prior_sd=0.08 retained the 4.51m median
-    # and reduced the standard deviation from 319k (0.12) to 256k.
-    # The other knobs stayed at their original values after the same check:
-    # risk_shift=0.50 lowered the median; soft_cap_factor=1.5 lowered it too;
-    # budget_penalty=0.10 did not change the observed scores.
-    prior_sd = 0.08
-    risk_shift = 0.35
+    # Allow 15 percentage points of transfer error in the historical push lift.
+    # This broad prior lets a 200-person pilot supply most posterior precision;
+    # it is an explicit uncertainty assumption, not a fitted population estimate.
+    prior_sd = 0.15
+    # Subtract one posterior standard deviation before scaling a campaign.
+    # This is a risk buffer, not a calibrated guarantee after candidate selection.
+    risk_shift = 1.0
+    # Charge 20% extra cost during initial allocation for spending scarce budget.
+    # Upgrades later compare their incremental gain with the actual remaining cost.
     budget_penalty = 0.20
+    # Allow two equal shares of the remaining budget, not half of that budget.
+    # The allocation also has a 4000 floor and a hard remaining-budget check.
     soft_cap_factor = 2.0
+    # Five cells, at most two candidates each: ordinary selection spends at most
+    # 5 * 2 * 200 * 4 = 8000 on SMS exploration, prioritizing high-value audiences.
     sms_pilot_top = 5
+    # The weakest estimate in a group must be at least 90% of its strongest.
+    # This limits estimated heterogeneity; it does not prove equal true effects.
+    merge_ratio_gap = 0.10
+    # Positive risk-adjusted lift is sufficient; no additional absolute cutoff.
+    merge_min_ratio = 0.0
+    # lift / sqrt(n) is the geometric mean of total lift and lift per contact:
+    # a symmetric compromise between campaign slots and the contact constraint.
+    option_density_weight = 0.50
+    enable_upgrades = True
+    # Expensive calls must fit initial budget reservations. Extrapolation from
+    # push/SMS can overstate call uplift when conversion reaches its upper bound,
+    # so spare-budget upgrades stay within the cheaper channels.
+    allow_call_exemption = False
+    allow_call_upgrade = False
 
     def act(self, env) -> list[dict]:
         try:
@@ -56,9 +76,9 @@ class Agent:
         if cells.empty:
             return self._fallback(env)
 
-        # An empirical prior. The transition frequency is the conversion proxy
-        # used in the public scoring rules; the mean ARPU change is clipped in
-        # the same way as the published mock model.
+        # Historical transition frequency is a heuristic conversion proxy, not
+        # an identified response probability for this audience. Bound extreme
+        # relative changes and let pilots correct the uncertain transfer.
         try:
             history = pd.read_csv(HISTORY)
             history = history[history.AVG_ARPU_PREV_3M >= 100].copy()
@@ -169,8 +189,8 @@ class Agent:
         if not observed:
             return self._fallback(env)
 
-        # One final tariff for each disjoint source cell. Compare channel gain
-        # against channel cost and the budget consumed by other campaigns.
+        # One final tariff for each disjoint source cell. Compatible cells can
+        # later share a campaign without losing their individual lift estimates.
         best_by_cell = {}
         for row, mean, uncertainty in observed:
             cell = (row.current_tariff, row.arpu_segment)
@@ -179,27 +199,44 @@ class Agent:
             if cell not in best_by_cell or value > best_by_cell[cell][0]:
                 best_by_cell[cell] = (value, row, conservative)
 
-        options = sorted(best_by_cell.values(), key=lambda x: x[0], reverse=True)
+        options = self._group_options(best_by_cell)
         campaigns = []
+        selected = []
         budget = float(env.remaining_budget)
         contacts = int(env.remaining_contacts)
         channel_order = ["push", "sms", "digital_ads", "call"]
-        for _, row, ratio_push in options:
-            if len(campaigns) >= 10 or contacts <= 0 or ratio_push <= 0:
+        top_call_candidates = set(
+            sorted(range(len(options)), key=lambda i: options[i]["push_lift"] / options[i]["n"],
+                   reverse=True)[:2]
+        )
+        for index, option in enumerate(options):
+            if len(campaigns) >= 10 or contacts <= 0:
                 break
-            n = min(int(row.n), 5000, contacts)
+            n = option["n"]
+            if n > contacts:
+                # A partial multi-tariff filter would contact an arbitrary ID
+                # prefix, so skip it and look for a smaller complete group.
+                continue
             # Reserve a portion of budget for remaining cells. The value of
             # an option includes an opportunity charge on scarce budget.
             best = None
-            remaining_slots = max(1, min(10 - len(campaigns), len(options) - len(campaigns)))
+            remaining_slots = max(1, min(10 - len(campaigns), len(options) - index))
             soft_cap = max(budget / remaining_slots * self.soft_cap_factor, 4000.0)
             for channel in channel_order:
                 info = env.channels[channel]
                 cost = float(info["cost_per_contact"])
                 multiplier = float(info["conversion_multiplier"])
-                if cost * n > budget or cost * n > soft_cap and channel != "push":
+                # A high-value group may justify a call even when the soft
+                # reservation for later campaigns would otherwise exclude it.
+                exempt_call = (
+                    self.allow_call_exemption and channel == "call"
+                    and index in top_call_candidates
+                )
+                if cost * n > budget or (
+                    cost * n > soft_cap and channel != "push" and not exempt_call
+                ):
                     continue
-                expected = n * (row.arpu * ratio_push * multiplier / 0.50 - cost)
+                expected = option["push_lift"] * multiplier / 0.50 - n * cost
                 utility = expected - self.budget_penalty * cost * n
                 if best is None or utility > best[0]:
                     best = (utility, channel, cost, expected)
@@ -207,15 +244,97 @@ class Agent:
                 continue
             _, channel, cost, _ = best
             campaigns.append({
-                "campaign_name": f"adaptive_{len(campaigns)+1}_{row.current_tariff}_{row.tariff_plan_code_to}",
-                "filter_current_tariff": row.current_tariff,
-                "filter_arpu_segment": row.arpu_segment,
-                "target_tariff": row.tariff_plan_code_to,
+                "campaign_name": f"adaptive_{len(campaigns)+1}_{option['target']}",
+                "filter_current_tariff": ";".join(option["sources"]),
+                "filter_arpu_segment": option["segment"],
+                "target_tariff": option["target"],
                 "channel": channel,
             })
+            selected.append(option)
             budget -= n * cost
             contacts -= n
+
+        # The soft cap only reserves budget while building the plan. Once all
+        # groups are chosen, spend the remainder on profitable channel upgrades.
+        while budget > 0 and self.enable_upgrades:
+            upgrade = None
+            for i, option in enumerate(selected):
+                old = env.channels[campaigns[i]["channel"]]
+                for channel in channel_order:
+                    if channel == "call" and not self.allow_call_upgrade:
+                        continue
+                    new = env.channels[channel]
+                    extra = option["n"] * (
+                        float(new["cost_per_contact"]) - float(old["cost_per_contact"])
+                    )
+                    if extra <= 0 or extra > budget:
+                        continue
+                    gain = (
+                        option["push_lift"]
+                        * (float(new["conversion_multiplier"])
+                           - float(old["conversion_multiplier"])) / 0.50
+                        - extra
+                    )
+                    if gain > 0 and (upgrade is None or gain > upgrade[0]):
+                        upgrade = (gain, i, channel, extra)
+            if upgrade is None:
+                break
+            _, i, channel, extra = upgrade
+            campaigns[i]["channel"] = channel
+            budget -= extra
         return campaigns or self._fallback(env)
+
+    def _group_options(self, best_by_cell):
+        buckets = {}
+        for _, row, ratio in best_by_cell.values():
+            if ratio > 0:
+                buckets.setdefault((row.arpu_segment, row.tariff_plan_code_to), []).append(
+                    (row, ratio)
+                )
+
+        options = []
+        for (segment, target), entries in buckets.items():
+            entries.sort(key=lambda item: item[1], reverse=True)
+            group = []
+            group_n = 0
+            anchor = None
+            for row, ratio in entries:
+                n = min(int(row.n), 5000)
+                if ratio < self.merge_min_ratio:
+                    if group:
+                        options.append(self._make_option(segment, target, group))
+                        group, group_n, anchor = [], 0, None
+                    options.append(self._make_option(segment, target, [(row, ratio, n)]))
+                    continue
+                if group and (ratio < anchor * (1 - self.merge_ratio_gap)
+                              or group_n + n > 5000):
+                    options.append(self._make_option(segment, target, group))
+                    group, group_n, anchor = [], 0, None
+                if not group:
+                    anchor = ratio
+                group.append((row, ratio, n))
+                group_n += n
+            if group:
+                options.append(self._make_option(segment, target, group))
+        return sorted(
+            options,
+            key=lambda option: option["push_lift"] / option["n"]**self.option_density_weight,
+            reverse=True,
+        )
+
+    @staticmethod
+    def _make_option(segment, target, group):
+        n = sum(item[2] for item in group)
+        push_lift = sum(item[2] * float(item[0].arpu) * item[1] for item in group)
+        return {
+            "segment": segment,
+            "target": target,
+            "sources": [item[0].current_tariff for item in group],
+            "n": n,
+            # Count-weighted estimate, retained for auditing grouped campaigns.
+            "ratio_push": sum(item[2] * item[1] for item in group) / n,
+            "push_lift": push_lift,
+        }
 
     @staticmethod
     def _select_candidates(candidates, pilots_left, max_per_cell, max_per_target):
