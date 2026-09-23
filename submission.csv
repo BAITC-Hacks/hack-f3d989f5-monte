@@ -1,0 +1,11 @@
+campaign_name,filter_arpu_segment,filter_data_segment,filter_call_segment,filter_current_tariff,target_tariff,channel
+adaptive_1_tariff_13_tariff_8,MID,,,tariff_13,tariff_8,sms
+adaptive_2_tariff_4_tariff_8,MID,,,tariff_4,tariff_8,sms
+adaptive_3_tariff_10_tariff_11,MID,,,tariff_10,tariff_11,digital_ads
+adaptive_4_tariff_8_tariff_9,LOW,,,tariff_8,tariff_9,digital_ads
+adaptive_5_tariff_4_tariff_9,LOW,,,tariff_4,tariff_9,digital_ads
+adaptive_6_tariff_13_tariff_8,LOW,,,tariff_13,tariff_8,digital_ads
+adaptive_7_tariff_14_tariff_9,LOW,,,tariff_14,tariff_9,digital_ads
+adaptive_8_tariff_11_tariff_8,MID,,,tariff_11,tariff_8,digital_ads
+adaptive_9_tariff_12_tariff_8,MID,,,tariff_12,tariff_8,digital_ads
+adaptive_10_tariff_8_tariff_11,MID,,,tariff_8,tariff_11,sms
