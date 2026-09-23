@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Beeline Tariff Marketing Campaigns — агент
 
 ## Запуск
@@ -37,3 +38,7 @@ python make_submission.py
 На мок модели `python local_eval.py --runs 10`: 10 из 10 прогонов в плюс,
 минимум 3 578 157, медиана 4 403 434, максимум 4 616 253 у.е. Это проверка
 механики и устойчивости к шуму; в финале модель эффектов другая.
+=======
+# hack-f3d989f5-monte
+Hackathon team repository for monte
+>>>>>>> 0a5dbc52b5296b6a2116840ef8552252b4bd3861
